@@ -8,17 +8,17 @@ VIRTUAL_SERVICE_NAME = "sd-api-virtual"
 
 # 사전에 정의된 GPU 모델 성능 - GPU 모델 명 기준으로 성능 지표를 걸어야함!
 GPU_PERFORMANCE = {
-    "node-1": 2.0,  # 성능이 좋은 GPU 모델에 더 높은 점수 부여
-    "node-2": 1.5,
-    "node-3": 1.0
+    "NVIDIA GeForce RTX 3070": 1.0,  # 성능이 좋은 GPU 모델에 더 높은 점수 부여
+    "NVIDIA GeForce RTX 4070": 1.5,
+    "NVIDIA A10": 2.0  # 나중에 사용할 수 있는 데이터 센터 급의 gpu이름으로 변환
 }
 
 
 def get_gpu_metrics():
     # GPU 메트릭 수집 쿼리
-    gpu_usage_query = "dcgm_gpu_utilization"
-    mem_usage_query = "dcgm_mem_copy_utilization"
-    power_usage_query = "dcgm_power_usage"
+    gpu_usage_query = "DCGM_FI_DEV_GPU_UTIL{}"
+    mem_usage_query = "DCGM_FI_DEV_MEM_COPY_UTIL{}"
+    power_usage_query = "DCGM_FI_DEV_POWER_USAGE{}"
 
     # Prometheus에서 데이터 가져오기
     gpu_usage = requests.get(f"{PROMETHEUS_URL}?query={gpu_usage_query}").json()
@@ -79,31 +79,26 @@ def main():
 
     weights = {}
 
-    # GPU 노드 정보 수집 및 점수 계산
-    for node_name, gpu_perf in GPU_PERFORMANCE.items():
-        # GPU 사용량 가져오기
-        gpu_used = next(
-            (float(m["value"][1]) for m in gpu_usage["data"]["result"] if m["metric"]["instance"] == node_name),
-            0
-        )
+    match = {"pod_name": "label number like 1, 2, 3, ...", }
 
-        # 메모리 사용량 가져오기
-        mem_used = next(
-            (float(m["value"][1]) for m in mem_usage["data"]["result"] if m["metric"]["instance"] == node_name),
-            0
-        )
+    for node in gpu_usage["data"]["result"]:
+        pod_name = node["metric"]["pod"]
+        if pod_name not in match.keys():
+            continue
 
-        # 전력 소모량 가져오기
+        gpu_perf = GPU_PERFORMANCE.get(node["metric"]["modelName"], 1.0)  # 사전에 정의된 성능
+        gpu_used = float(node["value"][1])
+
+        # GPU 메모리 및 전력 소모 정보 가져오기
+        mem_used = next((m["value"][1] for m in mem_usage["data"]["result"] if m["metric"]["instance"] == pod_name), 0)
         power_used = next(
-            (float(p["value"][1]) for p in power_usage["data"]["result"] if p["metric"]["instance"] == node_name),
-            0
-        )
+            (p["value"][1] for p in power_usage["data"]["result"] if p["metric"]["instance"] == pod_name), 0)
 
         # 상태 점수 계산
-        score = calculate_node_score(gpu_perf, gpu_used, mem_used, power_used)
+        score = calculate_node_score(gpu_perf, gpu_used, float(mem_used), float(power_used))
 
         # 점수를 기반으로 가중치 설정 (점수가 높을수록 가중치 큼)
-        weights[node_name] = score
+        weights[match[pod_name]] = score
 
     # VirtualService 업데이트
     update_virtual_service(weights)
