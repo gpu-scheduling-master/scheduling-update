@@ -6,11 +6,10 @@ PROMETHEUS_URL = "http://kube-prometheus-stack-prometheus.monitoring.svc:9090/ap
 ISTIO_INGRESS_NAMESPACE = "intern"
 VIRTUAL_SERVICE_NAME = "sd-api-virtual"
 
-# 사전에 정의된 GPU 모델 성능 - GPU 모델 명 기준으로 성능 지표를 걸어야함!
+# 사전에 정의된 GPU 모델 성능
 GPU_PERFORMANCE = {
-    "NVIDIA GeForce RTX 3070": 1.0,  # 성능이 좋은 GPU 모델에 더 높은 점수 부여
-    "NVIDIA GeForce RTX 4070": 1.5,
-    "NVIDIA A10": 2.0  # 나중에 사용할 수 있는 데이터 센터 급의 gpu이름으로 변환
+    "NVIDIA GeForce RTX 3070": 1.0,
+    "NVIDIA GeForce RTX 4070": 1.4,
 }
 
 
@@ -29,20 +28,19 @@ def get_gpu_metrics():
 
 
 def calculate_node_score(gpu_perf, gpu_usage, mem_usage, power_usage):
-    # 상태 점수 계산 (성능, 사용량, 메모리, 전력 소모 기반)
-    performance_weight = 0.4
+    # 상태 점수 계산
+    performance_weight = 100
     usage_weight = 0.3
     mem_weight = 0.2
     power_weight = 0.1
 
-    # GPU 사용량과 메모리 사용량, 전력 소모는 낮을수록 좋기 때문에 역으로 처리
     score = (
             performance_weight * gpu_perf -
             usage_weight * gpu_usage -
             mem_weight * mem_usage -
             power_weight * power_usage
     )
-    return max(score, 0)  # 점수가 0보다 작아지지 않도록 설정
+    return max(score, 0)
 
 
 def update_virtual_service(weights):
@@ -50,16 +48,16 @@ def update_virtual_service(weights):
     routes = []
     total_score = sum(weights.values())
 
-    for idx, (node, score) in enumerate(weights.items()):
-        weight = int((score / total_score) * 100)  # 퍼센트 기반 가중치 계산
+    for idx, (subset_name, score) in enumerate(weights.items()):
+        weight = int((score / total_score) * 100)
         routes.append({
             "op": "replace",
             "path": f"/spec/http/0/route/{idx}/weight",
             "value": weight
         })
 
-    # JSON Patch를 적용하여 VirtualService 업데이트
     patch_payload = json.dumps(routes)
+
     try:
         subprocess.run(
             [
@@ -79,26 +77,30 @@ def main():
 
     weights = {}
 
-    match = {"pod_name": "label number like 1, 2, 3, ...", }
-
-    for node in gpu_usage["data"]["result"]:
-        pod_name = node["metric"]["pod"]
-        if pod_name not in match.keys():
+    # Prometheus에서 가져온 GPU 메트릭을 기반으로 가중치 계산
+    for gpu in gpu_usage["data"]["result"]:
+        pod_name = gpu["metric"].get("pod")
+        if not pod_name or not pod_name.startswith("stable-diffusion-api"):
             continue
+        subset_name = pod_name  # subset 이름은 Pod 이름과 동일하게 매핑
 
-        gpu_perf = GPU_PERFORMANCE.get(node["metric"]["modelName"], 1.0)  # 사전에 정의된 성능
-        gpu_used = float(node["value"][1])
+        # GPU 성능과 사용량 데이터 가져오기
+        gpu_perf = GPU_PERFORMANCE.get(gpu["metric"].get("modelName", "NVIDIA GeForce RTX 3070"), 1.0)
+        gpu_used = float(gpu["value"][1])
 
         # GPU 메모리 및 전력 소모 정보 가져오기
-        mem_used = next((m["value"][1] for m in mem_usage["data"]["result"] if m["metric"]["instance"] == pod_name), 0)
+        mem_used = next(
+            (float(m["value"][1]) for m in mem_usage["data"]["result"] if m["metric"].get("pod") == pod_name),
+            0
+        )
         power_used = next(
-            (p["value"][1] for p in power_usage["data"]["result"] if p["metric"]["instance"] == pod_name), 0)
+            (float(p["value"][1]) for p in power_usage["data"]["result"] if p["metric"].get("pod") == pod_name),
+            0
+        )
 
-        # 상태 점수 계산
-        score = calculate_node_score(gpu_perf, gpu_used, float(mem_used), float(power_used))
-
-        # 점수를 기반으로 가중치 설정 (점수가 높을수록 가중치 큼)
-        weights[match[pod_name]] = score
+        # 점수 계산
+        score = calculate_node_score(gpu_perf, gpu_used, mem_used, power_used)
+        weights[subset_name] = score
 
     # VirtualService 업데이트
     update_virtual_service(weights)
